@@ -129,6 +129,14 @@ func (fs *fileSys) simOperations(ops []Op) error {
 		case "READ":
 		case "WRITE":
 			err = fs.write(op.Inode, op.Off, op.Data)
+		case "RENAME":
+			// RENAME_NOREPLACE only succeeds if NewPath didn't exist, which
+			// makes it a plain rename. RENAME_EXCHANGE swaps two names.
+			if op.Flags != "" && op.Flags != "RENAME_NOREPLACE" {
+				err = fmt.Errorf("rename flags %s are not supported", op.Flags)
+			} else {
+				err = fs.rename(op.Path, op.NewPath)
+			}
 		case "FSYNC":
 			fallthrough
 		case "FDATASYNC":

@@ -30,6 +30,7 @@ var (
 	_ fs.NodeFlusher     = (*recNode)(nil)
 	_ fs.NodeReleaser    = (*recNode)(nil)
 	_ fs.NodeFsyncer     = (*recNode)(nil)
+	_ fs.NodeRenamer     = (*recNode)(nil)
 )
 
 // WrapChild is called for every new file or directory the kernel asks about.
@@ -129,6 +130,44 @@ func (n *recNode) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) sysc
 		}
 		return syscall.ENOTSUP
 	})
+}
+
+// Rename: the program called rename(). n is the directory holding the old
+// name. Both paths and the moved file's inode are read before the real
+// rename runs, because it removes the old name.
+func (n *recNode) Rename(ctx context.Context, name string, newParent fs.InodeEmbedder, newName string, flags uint32) syscall.Errno {
+	o := Op{
+		Op:      "RENAME",
+		Path:    filepath.Join(n.name(), name),
+		NewPath: filepath.Join(newParent.EmbeddedInode().Path(nil), newName),
+		Flags:   renameFlags(flags),
+		Inode:   n.ino(),
+	}
+	if child := n.GetChild(name); child != nil {
+		o.ChildIno = child.StableAttr().Ino
+	}
+	return n.h.apply(&o, func(*Op) syscall.Errno {
+		return n.LoopbackNode.Rename(ctx, name, newParent, newName, flags)
+	})
+}
+
+// renameFlags turns renameat2() flags into readable text, e.g.
+// "RENAME_NOREPLACE". Plain rename() has none.
+func renameFlags(flags uint32) string {
+	var parts []string
+	for _, f := range []struct {
+		bit  uint32
+		name string
+	}{
+		{1, "RENAME_NOREPLACE"},
+		{fs.RENAME_EXCHANGE, "RENAME_EXCHANGE"},
+		{4, "RENAME_WHITEOUT"},
+	} {
+		if flags&f.bit != 0 {
+			parts = append(parts, f.name)
+		}
+	}
+	return strings.Join(parts, "|")
 }
 
 // openFlags turns open() flags into readable text, e.g. "O_WRONLY|O_APPEND".

@@ -10,7 +10,7 @@ import (
 // one Op per line, in the order our filesystem handled them.
 type Op struct {
 	Seq      uint64 `json:"seq"`
-	Op       string `json:"op"` // OPEN, CREATE, READ, WRITE, ACK, FSYNC, FDATASYNC, FLUSH, RELEASE
+	Op       string `json:"op"` // OPEN, CREATE, READ, WRITE, ACK, FSYNC, FDATASYNC, FLUSH, RELEASE, RENAME
 	Path     string `json:"path,omitempty"`
 	Off      int64  `json:"off,omitempty"`
 	Size     int64  `json:"size,omitempty"` // READ: bytes requested
@@ -19,6 +19,7 @@ type Op struct {
 	Err      string `json:"err,omitempty"`
 	Inode    uint64 `json:"inode,omitempty"`
 	ChildIno uint64 `json:"childIno,omitempty"`
+	NewPath  string `json:"newPath,omitempty"`
 }
 
 // writeTrace saves ops to path, one JSON object per line.
