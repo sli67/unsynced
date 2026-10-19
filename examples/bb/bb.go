@@ -2,11 +2,16 @@ package main
 
 import (
 	"fmt"
+	"os"
 
 	bolt "go.etcd.io/bbolt"
 )
 
 func main() {
+	tmp, _ := os.Create("shibina")
+	tmp.WriteString("yanks08635")
+	tmp.Close()
+
 	db, err := bolt.Open("my.db", 0o600, nil)
 	if err != nil {
 		panic(err)

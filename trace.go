@@ -9,13 +9,16 @@ import (
 // Op is one file operation in the trace. The trace is saved as JSON Lines:
 // one Op per line, in the order our filesystem handled them.
 type Op struct {
-	Seq   uint64 `json:"seq"`
-	Op    string `json:"op"` // OPEN, CREATE, WRITE, ACK, FSYNC, FDATASYNC, FLUSH, RELEASE
-	Path  string `json:"path,omitempty"`
-	Off   int64  `json:"off,omitempty"`
-	Data  []byte `json:"data,omitempty"` // full bytes written; JSON stores them as base64
-	Flags string `json:"flags,omitempty"`
-	Err   string `json:"err,omitempty"`
+	Seq      uint64 `json:"seq"`
+	Op       string `json:"op"` // OPEN, CREATE, READ, WRITE, ACK, FSYNC, FDATASYNC, FLUSH, RELEASE
+	Path     string `json:"path,omitempty"`
+	Off      int64  `json:"off,omitempty"`
+	Size     int64  `json:"size,omitempty"` // READ: bytes requested
+	Data     []byte `json:"data,omitempty"` // full bytes written; JSON stores them as base64
+	Flags    string `json:"flags,omitempty"`
+	Err      string `json:"err,omitempty"`
+	Inode    uint64 `json:"inode,omitempty"`
+	ChildIno uint64 `json:"childIno,omitempty"`
 }
 
 // writeTrace saves ops to path, one JSON object per line.
