@@ -2,17 +2,42 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 )
 
 const (
 	FILE      = 0
 	DIRECTORY = 1
 )
+
+type CrashSpec struct {
+	CrashAfter uint64   `json:"crashAfter"`
+	PersistSeq []uint64 `json:"persistSeq"`
+}
+
+// readCrashSpec loads a CrashSpec saved as JSON, e.g.
+// {"crashAfter": 12, "persistSeq": []}. Unknown fields are an error, so a
+// typo like "crash_after" isn't silently read as crashAfter 0.
+func readCrashSpec(path string) (CrashSpec, error) {
+	var spec CrashSpec
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return spec, err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&spec); err != nil {
+		return spec, fmt.Errorf("%s: %w", path, err)
+	}
+	if spec.CrashAfter < 0 {
+		return spec, fmt.Errorf("%s: crashAfter must be 0 or more", path)
+	}
+	return spec, nil
+}
 
 type inode struct {
 	kind      int
@@ -39,59 +64,32 @@ func initFs() *fileSys {
 	return &fs
 }
 
-// importDir loads everything under dir into the model as already durable:
-// these files were on disk before the program started. Call it on backingDir
-// after the -init copy and before mounting, so the inode numbers match the
-// ones FUSE records. dir itself is the root (index 0).
-func (fs *fileSys) importDir(dir string) error {
-	return fs.importChildren(fs.inodes[0], dir)
-}
-
-func (fs *fileSys) importChildren(parent *inode, dir string) error {
-	entries, err := os.ReadDir(dir)
+// initEntry adds a file or directory that was on disk before the program
+// started (an INIT op), so it is durable from the start.
+func (fs *fileSys) initEntry(path string, ino uint64, kind int, data []byte) error {
+	parent, err := fs.pathInode(filepath.Dir(path))
 	if err != nil {
 		return err
 	}
-	for _, e := range entries {
-		path := filepath.Join(dir, e.Name())
-		info, err := e.Info()
-		if err != nil {
-			return err
-		}
-		ino := info.Sys().(*syscall.Stat_t).Ino
-		parent.vChildren[e.Name()] = ino
-		parent.dChildren[e.Name()] = ino
-		if _, ok := fs.inode2Index[ino]; ok {
-			continue // a hard link to a file we already loaded
-		}
-
-		var child *inode
-		switch {
-		case info.Mode().IsRegular():
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			child = &inode{kind: FILE, vData: data, dData: bytes.Clone(data)}
-		case info.IsDir():
-			child = newDir()
-		default:
-			return fmt.Errorf("%s: unsupported file type %v", path, info.Mode().Type())
-		}
-		fs.inode2Index[ino] = len(fs.inodes)
-		fs.inodes = append(fs.inodes, child)
-
-		if child.kind == DIRECTORY {
-			if err := fs.importChildren(child, path); err != nil {
-				return err
-			}
-		}
+	if parent.kind != DIRECTORY {
+		return fmt.Errorf("%s: parent is not a directory", path)
 	}
+	name := filepath.Base(path)
+	parent.vChildren[name] = ino
+	parent.dChildren[name] = ino
+	if _, ok := fs.inode2Index[ino]; ok {
+		return nil // a hard link to a file we already have
+	}
+	child := &inode{kind: FILE, vData: data, dData: bytes.Clone(data)}
+	if kind == DIRECTORY {
+		child = newDir()
+	}
+	fs.inode2Index[ino] = len(fs.inodes)
+	fs.inodes = append(fs.inodes, child)
 	return nil
 }
 
 func (fs *fileSys) exportTo(ino uint64, currentDir string, childName string) error {
-	fmt.Fprintf(os.Stdout, "%s cname\n", childName)
 	if _, ok := fs.inode2Index[ino]; !ok {
 		return fmt.Errorf("inode number %d does not exist", ino)
 	}
@@ -120,29 +118,40 @@ func (fs *fileSys) exportTo(ino uint64, currentDir string, childName string) err
 	return nil
 }
 
-func (fs *fileSys) simOperations(ops []Op) error {
+func (fs *fileSys) simOperations(ops []Op, spec CrashSpec) error {
+	pers := make(map[uint64]bool)
+	for _, seqnum := range spec.PersistSeq {
+		pers[seqnum] = true
+	}
 	for _, op := range ops {
+		if op.Seq > spec.CrashAfter {
+			return nil
+		}
+
 		var err error
 		switch op.Op {
+		case "INIT_DIR":
+			err = fs.initEntry(op.Path, op.Inode, DIRECTORY, nil)
+		case "INIT_FILE":
+			err = fs.initEntry(op.Path, op.Inode, FILE, op.Data)
 		case "CREATE":
-			err = fs.create(op.Path, op.ChildIno)
+			err = fs.create(op.Path, op.ChildIno, pers[op.Seq])
 		case "READ":
 		case "WRITE":
-			err = fs.write(op.Inode, op.Off, op.Data)
+			err = fs.write(op.Inode, op.Off, op.Data, pers[op.Seq])
 		case "RENAME":
 			// RENAME_NOREPLACE only succeeds if NewPath didn't exist, which
 			// makes it a plain rename. RENAME_EXCHANGE swaps two names.
 			if op.Flags != "" && op.Flags != "RENAME_NOREPLACE" {
 				err = fmt.Errorf("rename flags %s are not supported", op.Flags)
 			} else {
-				err = fs.rename(op.Path, op.NewPath)
+				err = fs.rename(op.Path, op.NewPath, pers[op.Seq])
 			}
 		case "FSYNC":
 			fallthrough
 		case "FDATASYNC":
 			err = fs.fsync(op.Inode)
 		}
-
 		if err != nil {
 			return err
 		}
@@ -176,7 +185,7 @@ func (fs *fileSys) pathInode(path string) (*inode, error) {
 	return cur, nil
 }
 
-func (fs *fileSys) write(ino uint64, off int64, data []byte) error {
+func (fs *fileSys) write(ino uint64, off int64, data []byte, persist bool) error {
 	index, ok := fs.inode2Index[ino]
 	if !ok {
 		return fmt.Errorf("inode number %d does not exist", ino)
@@ -188,10 +197,18 @@ func (fs *fileSys) write(ino uint64, off int64, data []byte) error {
 		file.vData = append(file.vData, make([]byte, writeEnd-oldlen)...)
 	}
 	copy(file.vData[off:], data)
+	if persist {
+		st := off - off%PGSIZE
+		end := min(writeEnd+(PGSIZE-writeEnd%PGSIZE), int64(len(file.vData)))
+		if int64(len(file.dData)) < end {
+			file.dData = append(file.dData, make([]byte, end-int64(len(file.dData)))...)
+		}
+		copy(file.dData[st:end], file.vData[st:end])
+	}
 	return nil
 }
 
-func (fs *fileSys) create(path string, ino uint64) error {
+func (fs *fileSys) create(path string, ino uint64, persist bool) error {
 	_, ok := fs.inode2Index[ino]
 	if ok {
 		return fmt.Errorf("inode number %d already exists", ino)
@@ -210,13 +227,19 @@ func (fs *fileSys) create(path string, ino uint64) error {
 	fs.inode2Index[ino] = len(fs.inodes)
 	fs.inodes = append(fs.inodes, &inode{kind: FILE})
 	parent.vChildren[name] = ino
+	if persist {
+		parent.dChildren = make(map[string]uint64, len(parent.vChildren))
+		for k, v := range parent.vChildren {
+			parent.dChildren[k] = v
+		}
+	}
 	return nil
 }
 
 // rename moves the name oldPath to newPath, replacing whatever newPath named.
 // Like create, it only changes vChildren: each directory's change becomes
 // durable when that directory is fsynced.
-func (fs *fileSys) rename(oldPath string, newPath string) error {
+func (fs *fileSys) rename(oldPath string, newPath string, persist bool) error {
 	oldParent, err := fs.pathInode(filepath.Dir(oldPath))
 	if err != nil {
 		return err
@@ -255,6 +278,12 @@ func (fs *fileSys) rename(oldPath string, newPath string) error {
 	}
 	delete(oldParent.vChildren, oldName)
 	newParent.vChildren[newName] = ino
+	if persist {
+		fs.fsyncdir(oldParent)
+		if oldParent != newParent {
+			fs.fsyncdir(newParent)
+		}
+	}
 	return nil
 }
 
@@ -270,10 +299,14 @@ func (fs *fileSys) fsync(ino uint64) error {
 	if file.kind == FILE {
 		file.dData = append(file.dData[:0], file.vData...)
 	} else if file.kind == DIRECTORY {
-		file.dChildren = make(map[string]uint64, len(file.vChildren))
-		for k, v := range file.vChildren {
-			file.dChildren[k] = v
-		}
+		fs.fsyncdir(file)
 	}
 	return nil
+}
+
+func (fs *fileSys) fsyncdir(file *inode) {
+	file.dChildren = make(map[string]uint64, len(file.vChildren))
+	for k, v := range file.vChildren {
+		file.dChildren[k] = v
+	}
 }

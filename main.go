@@ -12,10 +12,11 @@
 //     the real files in backingDir, and record it in the trace.
 //   - When we unmount, mountDir becomes an empty directory again.
 //
-// Usage: pass the program to test (and any arguments for it):
+// Usage: record a program (and any arguments for it), then simulate:
 //
-//	go build -o /tmp/unsynced/example ./examples
-//	go run ./cmd/unsynced /tmp/unsynced/example
+//	go build -o /tmp/unsynced/bb ./examples/bb
+//	go run . record /tmp/unsynced/bb
+//	go run . simulate
 package main
 
 import (
@@ -48,11 +49,6 @@ const (
 	PGSIZE = 4096
 )
 
-type CrashSpec struct {
-	CrashAfter int   `json:"crashAfter"`
-	PersistSeq []int `json:"persistSeq"`
-}
-
 // harness is shared by every node in the filesystem. It numbers operations
 // and keeps the trace.
 //
@@ -77,52 +73,128 @@ func (h *harness) apply(o *Op, effect func(o *Op) syscall.Errno) syscall.Errno {
 	return errno
 }
 
+func usage() {
+	fmt.Fprintln(os.Stderr, `usage:
+  unsynced record [-init DIR] [-out DIR] PROGRAM [ARGS...]   run PROGRAM on FUSE and save its trace
+  unsynced simulate [-trace FILE] [-spec FILE] [-out DIR]    replay a trace in the model and write the crash state`)
+}
+
 func main() {
-	initDir := flag.String("init", "", "copy this directory into the filesystem before the program runs (default: start empty)")
-	flag.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: unsynced [-init DIR] PROGRAM [ARGS...]")
-		flag.PrintDefaults()
-	}
-	flag.Parse()
-	if flag.NArg() < 1 {
-		flag.Usage()
+	if len(os.Args) < 2 {
+		usage()
 		os.Exit(2)
 	}
-
-	//Record operations
-	// run loads the disk as it was before the program started into fs, and
-	// returns the ops it recorded, even when it also returns an error, e.g.
-	// when the program crashed partway: its trace is still worth testing.
-	fs := initFs()
-	ops, err := run(fs, flag.Arg(0), flag.Args()[1:], *initDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "unsynced: %v\n", err)
-		if ops == nil {
+	switch os.Args[1] {
+	case "record":
+		recordCmd(os.Args[2:])
+	case "simulate":
+		if err := simulateCmd(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "unsynced: %v\n", err)
 			os.Exit(1)
 		}
+	default:
+		usage()
+		os.Exit(2)
+	}
+}
+
+// recordCmd runs a program on our filesystem and saves its trace and acks.
+// The trace is saved even if the program failed partway: it's still worth
+// testing.
+func recordCmd(args []string) {
+	flags := flag.NewFlagSet("record", flag.ExitOnError)
+	initDir := flags.String("init", "", "copy this directory into the filesystem before the program runs (default: start empty)")
+	outDir := flags.String("out", "/tmp/unsynced", "where to save trace.jsonl and ack")
+	flags.Usage = usage
+	flags.Parse(args)
+	if flags.NArg() < 1 {
+		usage()
+		os.Exit(2)
+	}
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		fmt.Fprintf(os.Stderr, "unsynced: %v\n", err)
+		os.Exit(1)
+	}
+	ackPath := filepath.Join(*outDir, "ack")
+	tracePath := filepath.Join(*outDir, "trace.jsonl")
+
+	ops, err := run(flags.Arg(0), flags.Args()[1:], *initDir)
+	if ops != nil {
+		// Save the acks the example made, one per line.
+		var acks bytes.Buffer
+		for _, o := range ops {
+			if o.Op == "ACK" {
+				acks.Write(o.Data)
+				if !bytes.HasSuffix(o.Data, []byte("\n")) {
+					acks.WriteByte('\n')
+				}
+			}
+		}
+		if err := os.WriteFile(ackPath, acks.Bytes(), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "unsynced: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Acks written to", ackPath)
+
+		if err := writeTrace(tracePath, ops); err != nil {
+			fmt.Fprintf(os.Stderr, "unsynced: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Trace written to", tracePath)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unsynced: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// simulateCmd replays a saved trace in our model of the disk and writes out
+// what would survive a power loss after the last op. It doesn't use FUSE.
+func simulateCmd(args []string) error {
+	flags := flag.NewFlagSet("simulate", flag.ExitOnError)
+	tracePath := flags.String("trace", "/tmp/unsynced/trace.jsonl", "trace to replay")
+	outDir := flags.String("out", crashDir, "where to write the crash state")
+	specPath := flags.String("spec", "", "CrashSpec JSON file (default: crash after the last op, no unsynced data survives)")
+	flags.Usage = usage
+	flags.Parse(args)
+
+	ops, err := readTrace(*tracePath)
+	if err != nil {
+		return err
 	}
 
-	//Simulate Operations
-	if err := fs.simOperations(ops); err != nil {
-		fmt.Println(err)
+	var spec CrashSpec
+	if *specPath != "" {
+		if spec, err = readCrashSpec(*specPath); err != nil {
+			return err
+		}
+	} else {
+		spec.CrashAfter = 0xFFFFFFFF
 	}
-	if err := os.RemoveAll(crashDir); err != nil {
-		fmt.Println(err)
+
+	fs := initFs()
+	if err := fs.simOperations(ops, spec); err != nil {
+		return err
 	}
-	if err := os.MkdirAll(crashDir, 0o755); err != nil {
-		fmt.Println(err)
+	if err := os.RemoveAll(*outDir); err != nil {
+		return err
 	}
-	fs.fsync(0)
-	if err := fs.exportTo(0, crashDir, ""); err != nil {
-		fmt.Println(err)
+	if err := os.MkdirAll(*outDir, 0o755); err != nil {
+		return err
 	}
+	if err := fs.exportTo(0, *outDir, ""); err != nil {
+		return err
+	}
+	fmt.Printf("Results written to directory %s\n", *outDir)
+	return nil
 }
 
 // run tests program (a compiled binary, run with args) on our filesystem.
 // If initDir is not empty, its contents are on the filesystem when the
-// program starts, and are loaded into fs before it runs. It returns every
-// op recorded, even if it also returns an error.
-func run(fs *fileSys, program string, args []string, initDir string) ([]Op, error) {
+// program starts. The trace starts with INIT ops describing those files, so
+// it can be replayed later without them. It returns every op recorded, even
+// if it also returns an error.
+func run(program string, args []string, initDir string) ([]Op, error) {
 	// The example runs inside mountDir, so a relative path like ./example must
 	// be turned into an absolute one first. LookPath also finds programs in
 	// $PATH and checks that the file is executable.
@@ -150,39 +222,19 @@ func run(fs *fileSys, program string, args []string, initDir string) ([]Op, erro
 		return nil, err
 	}
 
-	// Load what's on disk now into the model, before the program changes
-	// anything. It must read backingDir, not initDir: the copies have their
-	// own inode numbers, and those are the ones FUSE records.
-	if err := fs.importDir(backingDir); err != nil {
-		return nil, fmt.Errorf("import %s: %w", backingDir, err)
+	// Describe what's on disk now, before the program changes anything. It
+	// must read backingDir, not initDir: the copies have their own inode
+	// numbers, and those are the ones FUSE records.
+	initOps, err := snapshot(backingDir)
+	if err != nil {
+		return nil, fmt.Errorf("snapshot %s: %w", backingDir, err)
 	}
 
 	// Steps 2-5: run the example on our filesystem until it exits.
-	h := &harness{}
+	h := &harness{ops: initOps}
 	if err := record(h, program, args); err != nil {
 		return h.ops, err
 	}
-
-	// Save the acks the example made, one per line.
-	var acks bytes.Buffer
-	for _, o := range h.ops {
-		if o.Op == "ACK" {
-			acks.Write(o.Data)
-			if !bytes.HasSuffix(o.Data, []byte("\n")) {
-				acks.WriteByte('\n')
-			}
-		}
-	}
-	if err := os.WriteFile("/tmp/unsynced/ack", acks.Bytes(), 0o644); err != nil {
-		return h.ops, err
-	}
-	fmt.Println("Acks written to /tmp/unsynced/ack")
-
-	if err := writeTrace("/tmp/unsynced/trace.jsonl", h.ops); err != nil {
-		return h.ops, err
-	}
-	fmt.Println("Trace written to /tmp/unsynced/trace.jsonl")
-
 	return h.ops, nil
 }
 
