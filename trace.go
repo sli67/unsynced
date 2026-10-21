@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -174,6 +175,21 @@ func initData(path string, rel string, ino uint64) ([]Op, error) {
 			return nil, err
 		}
 	}
+}
+
+// writeAcks saves the acks among ops up to and including seq crashAfter,
+// one per line.
+func writeAcks(path string, ops []Op, crashAfter uint64) error {
+	var acks strings.Builder
+	for _, o := range ops {
+		if o.Op == "ACK" && o.Seq <= crashAfter {
+			acks.WriteString(o.Ack)
+			if !strings.HasSuffix(o.Ack, "\n") {
+				acks.WriteByte('\n')
+			}
+		}
+	}
+	return os.WriteFile(path, []byte(acks.String()), 0o644)
 }
 
 // errName is errno as text for Op.Err, or "" for success.

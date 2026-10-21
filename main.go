@@ -20,14 +20,13 @@
 package main
 
 import (
-	"bytes"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"sync"
 	"syscall"
 
@@ -141,17 +140,7 @@ func recordCmd(args []string) {
 
 	ops, err := run(flags.Arg(0), flags.Args()[1:], *initDir, dataPath(tracePath))
 	if ops != nil {
-		// Save the acks the example made, one per line.
-		var acks bytes.Buffer
-		for _, o := range ops {
-			if o.Op == "ACK" {
-				acks.WriteString(o.Ack)
-				if !strings.HasSuffix(o.Ack, "\n") {
-					acks.WriteByte('\n')
-				}
-			}
-		}
-		if err := os.WriteFile(ackPath, acks.Bytes(), 0o644); err != nil {
+		if err := writeAcks(ackPath, ops, math.MaxUint64); err != nil {
 			fmt.Fprintf(os.Stderr, "unsynced: %v\n", err)
 			os.Exit(1)
 		}
@@ -207,6 +196,14 @@ func simulateCmd(args []string) error {
 		return err
 	}
 	fmt.Printf("Results written to directory %s\n", *outDir)
+
+	// The program only promised what it acked before the power failed: a
+	// checker must not expect anything acked later.
+	ackPath := filepath.Clean(*outDir) + ".ack"
+	if err := writeAcks(ackPath, ops, spec.CrashAfter); err != nil {
+		return err
+	}
+	fmt.Println("Acks made before the crash written to", ackPath)
 	return nil
 }
 
