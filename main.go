@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -56,9 +57,11 @@ const (
 // requests on many goroutines at once; without mu, an operation could be
 // recorded in a different order than it took effect.
 type harness struct {
-	mu  sync.Mutex
-	seq uint64
-	ops []Op // the trace, saved as JSON
+	mu       sync.Mutex
+	seq      uint64
+	ops      []Op     // the trace, saved as JSON
+	data     *os.File // data.bin: the bytes of WRITE and INIT_DATA ops, one after another
+	dataSize int64    // how much is in data
 }
 
 // apply performs one operation as a single step: run effect (the operation's
@@ -69,6 +72,7 @@ func (h *harness) apply(o *Op, effect func(o *Op) syscall.Errno) syscall.Errno {
 	errno := effect(o)
 	h.seq++
 	o.Seq, o.Err = h.seq, errName(errno)
+	h.store(o)
 	h.ops = append(h.ops, *o)
 	return errno
 }
@@ -77,6 +81,23 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   unsynced record [-init DIR] [-out DIR] PROGRAM [ARGS...]   run PROGRAM on FUSE and save its trace
   unsynced simulate [-trace FILE] [-spec FILE] [-out DIR]    replay a trace in the model and write the crash state`)
+}
+
+// store moves o.Data into data.bin and records where it went, so the trace
+// only holds its position. All-zero data isn't written, only its length.
+func (h *harness) store(o *Op) {
+	if o.Data == nil {
+		return
+	}
+	o.DataLen = int64(len(o.Data))
+	if isZero(o.Data) {
+		o.Zeros = true
+	} else {
+		h.data.Write(o.Data)
+		o.DataOff = h.dataSize
+		h.dataSize += o.DataLen
+	}
+	o.Data = nil
 }
 
 func main() {
@@ -104,7 +125,7 @@ func main() {
 func recordCmd(args []string) {
 	flags := flag.NewFlagSet("record", flag.ExitOnError)
 	initDir := flags.String("init", "", "copy this directory into the filesystem before the program runs (default: start empty)")
-	outDir := flags.String("out", "/tmp/unsynced", "where to save trace.jsonl and ack")
+	outDir := flags.String("out", "/tmp/unsynced", "where to save trace.jsonl, data.bin and ack")
 	flags.Usage = usage
 	flags.Parse(args)
 	if flags.NArg() < 1 {
@@ -118,14 +139,14 @@ func recordCmd(args []string) {
 	ackPath := filepath.Join(*outDir, "ack")
 	tracePath := filepath.Join(*outDir, "trace.jsonl")
 
-	ops, err := run(flags.Arg(0), flags.Args()[1:], *initDir)
+	ops, err := run(flags.Arg(0), flags.Args()[1:], *initDir, dataPath(tracePath))
 	if ops != nil {
 		// Save the acks the example made, one per line.
 		var acks bytes.Buffer
 		for _, o := range ops {
 			if o.Op == "ACK" {
-				acks.Write(o.Data)
-				if !bytes.HasSuffix(o.Data, []byte("\n")) {
+				acks.WriteString(o.Ack)
+				if !strings.HasSuffix(o.Ack, "\n") {
 					acks.WriteByte('\n')
 				}
 			}
@@ -194,7 +215,7 @@ func simulateCmd(args []string) error {
 // program starts. The trace starts with INIT ops describing those files, so
 // it can be replayed later without them. It returns every op recorded, even
 // if it also returns an error.
-func run(program string, args []string, initDir string) ([]Op, error) {
+func run(program string, args []string, initDir string, dataPath string) ([]Op, error) {
 	// The example runs inside mountDir, so a relative path like ./example must
 	// be turned into an absolute one first. LookPath also finds programs in
 	// $PATH and checks that the file is executable.
@@ -231,7 +252,17 @@ func run(program string, args []string, initDir string) ([]Op, error) {
 	}
 
 	// Steps 2-5: run the example on our filesystem until it exits.
-	h := &harness{ops: initOps}
+	// Written bytes go to dataPath as they happen, not into the trace.
+	data, err := os.Create(dataPath)
+	if err != nil {
+		return nil, err
+	}
+	defer data.Close()
+	h := &harness{data: data}
+	for i := range initOps {
+		h.store(&initOps[i])
+	}
+	h.ops = initOps
 	if err := record(h, program, args); err != nil {
 		return h.ops, err
 	}

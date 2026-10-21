@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"path/filepath"
@@ -96,9 +95,9 @@ func (n *recNode) Read(ctx context.Context, f fs.FileHandle, dest []byte, off in
 // Write: the program called write(). Writes to .ack are the program's
 // promises: we record them but never store them.
 func (n *recNode) Write(ctx context.Context, f fs.FileHandle, data []byte, off int64) (written uint32, errno syscall.Errno) {
-	o := Op{Op: "WRITE", Path: n.name(), Off: off, Data: bytes.Clone(data), Inode: n.ino()}
+	o := Op{Op: "WRITE", Path: n.name(), Off: off, Data: data, Inode: n.ino()}
 	if o.Path == ".ack" {
-		o.Op = "ACK"
+		o.Op, o.Ack, o.Data = "ACK", string(data), nil
 	}
 	errno = n.h.apply(&o, func(*Op) syscall.Errno {
 		if o.Op == "ACK" {

@@ -88,6 +88,22 @@ func (fs *fileSys) initEntry(path string, ino uint64, kind int, data []byte) err
 	return nil
 }
 
+// initData fills in part of a file that was on disk before the program
+// started (an INIT_DATA op); the rest of it is zeros.
+func (fs *fileSys) initData(ino uint64, off int64, data []byte) error {
+	index, ok := fs.inode2Index[ino]
+	if !ok {
+		return fmt.Errorf("inode number %d does not exist", ino)
+	}
+	file := fs.inodes[index]
+	end := off + int64(len(data))
+	file.vData = resize(file.vData, max(end, int64(len(file.vData))))
+	file.dData = resize(file.dData, max(end, int64(len(file.dData))))
+	copy(file.vData[off:], data)
+	copy(file.dData[off:], data)
+	return nil
+}
+
 func (fs *fileSys) exportTo(ino uint64, currentDir string, childName string) error {
 	if _, ok := fs.inode2Index[ino]; !ok {
 		return fmt.Errorf("inode number %d does not exist", ino)
@@ -135,7 +151,9 @@ func (fs *fileSys) simOperations(ops []Op, spec CrashSpec) error {
 		case "INIT_DIR":
 			err = fs.initEntry(op.Path, op.Inode, DIRECTORY, nil)
 		case "INIT_FILE":
-			err = fs.initEntry(op.Path, op.Inode, FILE, op.Data)
+			err = fs.initEntry(op.Path, op.Inode, FILE, make([]byte, op.Size))
+		case "INIT_DATA":
+			err = fs.initData(op.Inode, op.Off, op.Data)
 		case "CREATE":
 			err = fs.create(op.Path, op.ChildIno, pers[op.Seq])
 		case "MKDIR":
