@@ -13,10 +13,10 @@ import (
 // one Op per line, in the order our filesystem handled them.
 type Op struct {
 	Seq      uint64 `json:"seq"`
-	Op       string `json:"op"` // INIT_DIR, INIT_FILE, OPEN, CREATE, READ, WRITE, ACK, FSYNC, FDATASYNC, FLUSH, RELEASE, RENAME
+	Op       string `json:"op"` // INIT_DIR, INIT_FILE, OPEN, CREATE, MKDIR, READ, WRITE, ACK, TRUNCATE, FALLOCATE, FSYNC, FDATASYNC, FSYNCDIR, FLUSH, RELEASE, RENAME, UNLINK, RMDIR
 	Path     string `json:"path,omitempty"`
 	Off      int64  `json:"off,omitempty"`
-	Size     int64  `json:"size,omitempty"` // READ: bytes requested
+	Size     int64  `json:"size,omitempty"` // READ: bytes requested; TRUNCATE: new size; FALLOCATE: length
 	Data     []byte `json:"data,omitempty"` // full bytes written; JSON stores them as base64
 	Flags    string `json:"flags,omitempty"`
 	Err      string `json:"err,omitempty"`

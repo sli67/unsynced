@@ -47,6 +47,7 @@ type inode struct {
 type fileSys struct {
 	inode2Index map[uint64]int
 	inodes      []*inode
+	nextRetired uint64 // next number for retire; far above real inode numbers
 }
 
 // initFs returns an empty file system: just the root directory, which FUSE
@@ -57,6 +58,7 @@ func initFs() *fileSys {
 
 	fs.inodes = append(fs.inodes, newDir())
 	fs.inode2Index[0] = 0
+	fs.nextRetired = 1 << 63
 
 	return &fs
 }
@@ -124,6 +126,9 @@ func (fs *fileSys) simOperations(ops []Op, spec CrashSpec) error {
 		if op.Seq > spec.CrashAfter {
 			return nil
 		}
+		if op.Err != "" {
+			continue // it failed, so it changed nothing on disk
+		}
 
 		var err error
 		switch op.Op {
@@ -133,6 +138,20 @@ func (fs *fileSys) simOperations(ops []Op, spec CrashSpec) error {
 			err = fs.initEntry(op.Path, op.Inode, FILE, op.Data)
 		case "CREATE":
 			err = fs.create(op.Path, op.ChildIno, pers[op.Seq])
+		case "MKDIR":
+			err = fs.mkdir(op.Path, op.ChildIno, pers[op.Seq])
+		case "OPEN":
+			if strings.Contains(op.Flags, "O_TRUNC") {
+				err = fs.truncate(op.Inode, 0, pers[op.Seq])
+			}
+		case "UNLINK":
+			err = fs.unlink(op.Path, FILE, pers[op.Seq])
+		case "RMDIR":
+			err = fs.unlink(op.Path, DIRECTORY, pers[op.Seq])
+		case "TRUNCATE":
+			err = fs.truncate(op.Inode, op.Size, pers[op.Seq])
+		case "FALLOCATE":
+			err = fs.fallocate(op.Inode, op.Off, op.Size, op.Flags, pers[op.Seq])
 		case "READ":
 		case "WRITE":
 			err = fs.write(op.Inode, op.Off, op.Data, pers[op.Seq])
@@ -147,6 +166,8 @@ func (fs *fileSys) simOperations(ops []Op, spec CrashSpec) error {
 		case "FSYNC":
 			fallthrough
 		case "FDATASYNC":
+			fallthrough
+		case "FSYNCDIR":
 			err = fs.fsync(op.Inode)
 		}
 		if err != nil {
@@ -206,10 +227,15 @@ func (fs *fileSys) write(ino uint64, off int64, data []byte, persist bool) error
 }
 
 func (fs *fileSys) create(path string, ino uint64, persist bool) error {
-	_, ok := fs.inode2Index[ino]
-	if ok {
-		return fmt.Errorf("inode number %d already exists", ino)
-	}
+	return fs.newEntry(path, ino, &inode{kind: FILE}, persist)
+}
+
+func (fs *fileSys) mkdir(path string, ino uint64, persist bool) error {
+	return fs.newEntry(path, ino, newDir(), persist)
+}
+
+// newEntry adds child, a new file or directory, at path with inode number ino.
+func (fs *fileSys) newEntry(path string, ino uint64, child *inode, persist bool) error {
 	parent, err := fs.pathInode(filepath.Dir(path))
 	if err != nil {
 		return err
@@ -221,13 +247,118 @@ func (fs *fileSys) create(path string, ino uint64, persist bool) error {
 	if _, ok := parent.vChildren[name]; ok {
 		return fmt.Errorf("%s: already exists", path)
 	}
+	if _, ok := fs.inode2Index[ino]; ok {
+		fs.retire(ino)
+	}
 	fs.inode2Index[ino] = len(fs.inodes)
-	fs.inodes = append(fs.inodes, &inode{kind: FILE})
+	fs.inodes = append(fs.inodes, child)
 	parent.vChildren[name] = ino
 	if persist {
-		parent.dChildren = make(map[string]uint64, len(parent.vChildren))
-		for k, v := range parent.vChildren {
-			parent.dChildren[k] = v
+		fs.fsyncdir(parent)
+	}
+	return nil
+}
+
+// retire gives the inode now known as ino an unused number, so ino can name
+// a new file. The real file system reuses inode numbers after an unlink, but
+// a durable directory may still point at the old file, and must keep finding
+// the old file's data.
+func (fs *fileSys) retire(ino uint64) {
+	retired := fs.nextRetired
+	fs.nextRetired++
+	fs.inode2Index[retired] = fs.inode2Index[ino]
+	delete(fs.inode2Index, ino)
+	for _, dir := range fs.inodes {
+		if dir.kind != DIRECTORY {
+			continue
+		}
+		for _, children := range []map[string]uint64{dir.vChildren, dir.dChildren} {
+			for name, c := range children {
+				if c == ino {
+					children[name] = retired
+				}
+			}
+		}
+	}
+}
+
+// unlink removes the name path (unlink() for a FILE, rmdir() for a
+// DIRECTORY). The inode stays in the model: a durable directory may still
+// name it, and an open fd may still write to it.
+func (fs *fileSys) unlink(path string, kind int, persist bool) error {
+	parent, err := fs.pathInode(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	name := filepath.Base(path)
+	ino, ok := parent.vChildren[name]
+	if !ok {
+		return fmt.Errorf("%s: no such file or directory", path)
+	}
+	file := fs.inodes[fs.inode2Index[ino]]
+	if kind == FILE && file.kind == DIRECTORY {
+		return fmt.Errorf("%s: is a directory", path)
+	}
+	if kind == DIRECTORY {
+		if file.kind != DIRECTORY {
+			return fmt.Errorf("%s: not a directory", path)
+		}
+		if len(file.vChildren) != 0 {
+			return fmt.Errorf("%s: directory not empty", path)
+		}
+	}
+	delete(parent.vChildren, name)
+	if persist {
+		fs.fsyncdir(parent)
+	}
+	return nil
+}
+
+// truncate sets the file's size: cuts the end off, or grows it with zeros.
+func (fs *fileSys) truncate(ino uint64, size int64, persist bool) error {
+	index, ok := fs.inode2Index[ino]
+	if !ok {
+		return fmt.Errorf("inode number %d does not exist", ino)
+	}
+	file := fs.inodes[index]
+	if file.kind != FILE {
+		return fmt.Errorf("inode number %d: truncate of a directory", ino)
+	}
+	file.vData = resize(file.vData, size)
+	if persist {
+		file.dData = resize(file.dData, size)
+	}
+	return nil
+}
+
+// resize cuts b to size bytes, or grows it with zeros.
+func resize(b []byte, size int64) []byte {
+	if oldlen := int64(len(b)); size < oldlen {
+		return b[:size]
+	} else {
+		return append(b, make([]byte, size-oldlen)...)
+	}
+}
+
+// fallocate replays fallocate(): it reserves space, and grows the file with
+// zeros if off+length is past the end, unless FALLOC_FL_KEEP_SIZE is set.
+func (fs *fileSys) fallocate(ino uint64, off int64, length int64, flags string, persist bool) error {
+	index, ok := fs.inode2Index[ino]
+	if !ok {
+		return fmt.Errorf("inode number %d does not exist", ino)
+	}
+	file := fs.inodes[index]
+	switch flags {
+	case "FALLOC_FL_KEEP_SIZE":
+		return nil // only reserves space: nothing the model can see
+	case "":
+	default:
+		return fmt.Errorf("fallocate flags %s are not supported", flags)
+	}
+	if end := off + length; end > int64(len(file.vData)) {
+		file.vData = resize(file.vData, end)
+		if persist {
+			file.dData = resize(file.dData, max(end, int64(len(file.dData))))
 		}
 	}
 	return nil

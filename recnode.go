@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -22,15 +23,21 @@ type recNode struct {
 
 // The compiler checks that recNode has the methods go-fuse looks for.
 var (
-	_ fs.NodeWrapChilder = (*recNode)(nil)
-	_ fs.NodeOpener      = (*recNode)(nil)
-	_ fs.NodeCreater     = (*recNode)(nil)
-	_ fs.NodeReader      = (*recNode)(nil)
-	_ fs.NodeWriter      = (*recNode)(nil)
-	_ fs.NodeFlusher     = (*recNode)(nil)
-	_ fs.NodeReleaser    = (*recNode)(nil)
-	_ fs.NodeFsyncer     = (*recNode)(nil)
-	_ fs.NodeRenamer     = (*recNode)(nil)
+	_ fs.NodeWrapChilder    = (*recNode)(nil)
+	_ fs.NodeOpener         = (*recNode)(nil)
+	_ fs.NodeCreater        = (*recNode)(nil)
+	_ fs.NodeReader         = (*recNode)(nil)
+	_ fs.NodeWriter         = (*recNode)(nil)
+	_ fs.NodeFlusher        = (*recNode)(nil)
+	_ fs.NodeReleaser       = (*recNode)(nil)
+	_ fs.NodeFsyncer        = (*recNode)(nil)
+	_ fs.NodeRenamer        = (*recNode)(nil)
+	_ fs.NodeMkdirer        = (*recNode)(nil)
+	_ fs.NodeUnlinker       = (*recNode)(nil)
+	_ fs.NodeRmdirer        = (*recNode)(nil)
+	_ fs.NodeSetattrer      = (*recNode)(nil)
+	_ fs.NodeAllocater      = (*recNode)(nil)
+	_ fs.NodeOpendirHandler = (*recNode)(nil)
 )
 
 // WrapChild is called for every new file or directory the kernel asks about.
@@ -67,7 +74,9 @@ func (n *recNode) Create(ctx context.Context, name string, flags uint32, mode ui
 		&Op{Op: "CREATE", Path: filepath.Join(n.name(), name), Flags: openFlags(flags), Inode: n.ino()}, func(o *Op) syscall.Errno {
 			var errno syscall.Errno
 			inode, fh, fuseFlags, errno = n.LoopbackNode.Create(ctx, name, flags, mode, out)
-			o.ChildIno = inode.StableAttr().Ino
+			if errno == 0 {
+				o.ChildIno = inode.StableAttr().Ino
+			}
 			return errno
 		})
 	return inode, fh, fuseFlags, errno
@@ -148,6 +157,119 @@ func (n *recNode) Rename(ctx context.Context, name string, newParent fs.InodeEmb
 	}
 	return n.h.apply(&o, func(*Op) syscall.Errno {
 		return n.LoopbackNode.Rename(ctx, name, newParent, newName, flags)
+	})
+}
+
+// Mkdir: the program called mkdir().
+func (n *recNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse.EntryOut) (inode *fs.Inode, errno syscall.Errno) {
+	errno = n.h.apply(&Op{Op: "MKDIR", Path: filepath.Join(n.name(), name), Inode: n.ino()}, func(o *Op) syscall.Errno {
+		var errno syscall.Errno
+		inode, errno = n.LoopbackNode.Mkdir(ctx, name, mode, out)
+		if errno == 0 {
+			o.ChildIno = inode.StableAttr().Ino
+		}
+		return errno
+	})
+	return inode, errno
+}
+
+// Unlink: the program removed a file's name with unlink() (os.Remove).
+func (n *recNode) Unlink(ctx context.Context, name string) syscall.Errno {
+	o := Op{Op: "UNLINK", Path: filepath.Join(n.name(), name), Inode: n.ino()}
+	if child := n.GetChild(name); child != nil {
+		o.ChildIno = child.StableAttr().Ino
+	}
+	return n.h.apply(&o, func(*Op) syscall.Errno {
+		return n.LoopbackNode.Unlink(ctx, name)
+	})
+}
+
+// Rmdir: the program removed an empty directory with rmdir().
+func (n *recNode) Rmdir(ctx context.Context, name string) syscall.Errno {
+	o := Op{Op: "RMDIR", Path: filepath.Join(n.name(), name), Inode: n.ino()}
+	if child := n.GetChild(name); child != nil {
+		o.ChildIno = child.StableAttr().Ino
+	}
+	return n.h.apply(&o, func(*Op) syscall.Errno {
+		return n.LoopbackNode.Rmdir(ctx, name)
+	})
+}
+
+// Setattr: the program changed a file's attributes. We only record a size
+// change (truncate(), ftruncate()), the one the model needs; mode, owner and
+// time changes pass through unrecorded.
+func (n *recNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	size, ok := in.GetSize()
+	if !ok {
+		return n.LoopbackNode.Setattr(ctx, f, in, out)
+	}
+	return n.h.apply(&Op{Op: "TRUNCATE", Path: n.name(), Size: int64(size), Inode: n.ino()}, func(*Op) syscall.Errno {
+		return n.LoopbackNode.Setattr(ctx, f, in, out)
+	})
+}
+
+// Allocate: the program called fallocate() to reserve space, and maybe grow
+// the file with zeros (when mode has no FALLOC_FL_KEEP_SIZE).
+func (n *recNode) Allocate(ctx context.Context, f fs.FileHandle, off uint64, size uint64, mode uint32) syscall.Errno {
+	o := Op{Op: "FALLOCATE", Path: n.name(), Off: int64(off), Size: int64(size), Flags: fallocFlags(mode), Inode: n.ino()}
+	return n.h.apply(&o, func(*Op) syscall.Errno {
+		if a, ok := f.(fs.FileAllocater); ok {
+			return a.Allocate(ctx, off, size, mode)
+		}
+		return syscall.ENOTSUP
+	})
+}
+
+// fallocFlags turns a fallocate() mode into text. Plain fallocate() has
+// none; KEEP_SIZE is the only flag the model handles, so others are left as
+// a number for the model to reject.
+func fallocFlags(mode uint32) string {
+	switch mode {
+	case 0:
+		return ""
+	case 1:
+		return "FALLOC_FL_KEEP_SIZE"
+	default:
+		return fmt.Sprintf("0x%x", mode)
+	}
+}
+
+// dirHandle is what go-fuse's loopback returns when a directory is opened.
+// go-fuse sends fsync() on a directory (FSYNCDIR) to this handle, not to
+// the node, so to record it we wrap the handle.
+type dirHandle interface {
+	fs.FileReaddirenter
+	fs.FileSeekdirer
+	fs.FileReleasedirer
+	fs.FileFsyncdirer
+}
+
+// recDir is an open directory. It passes everything to the loopback handle
+// and records Fsyncdir.
+type recDir struct {
+	dirHandle
+	n *recNode
+}
+
+// OpendirHandle: the program opened a directory (for reading it, or to fsync
+// it). We hand back a recDir so its fsync is recorded.
+func (n *recNode) OpendirHandle(ctx context.Context, flags uint32) (fs.FileHandle, uint32, syscall.Errno) {
+	fh, fuseFlags, errno := n.LoopbackNode.OpendirHandle(ctx, flags)
+	if errno != 0 {
+		return nil, 0, errno
+	}
+	dh, ok := fh.(dirHandle)
+	if !ok {
+		return fh, fuseFlags, 0 // can't wrap it: its fsyncs won't be recorded
+	}
+	return &recDir{dirHandle: dh, n: n}, fuseFlags, 0
+}
+
+// Fsyncdir: the program called fsync() on a directory. Its name changes
+// (creates, renames, unlinks) so far would now survive a power loss.
+func (d *recDir) Fsyncdir(ctx context.Context, flags uint32) syscall.Errno {
+	return d.n.h.apply(&Op{Op: "FSYNCDIR", Path: d.n.name(), Inode: d.n.ino()}, func(*Op) syscall.Errno {
+		return d.dirHandle.Fsyncdir(ctx, flags)
 	})
 }
 
