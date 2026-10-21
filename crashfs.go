@@ -33,9 +33,6 @@ func readCrashSpec(path string) (CrashSpec, error) {
 	if err := dec.Decode(&spec); err != nil {
 		return spec, fmt.Errorf("%s: %w", path, err)
 	}
-	if spec.CrashAfter < 0 {
-		return spec, fmt.Errorf("%s: crashAfter must be 0 or more", path)
-	}
 	return spec, nil
 }
 
@@ -199,7 +196,7 @@ func (fs *fileSys) write(ino uint64, off int64, data []byte, persist bool) error
 	copy(file.vData[off:], data)
 	if persist {
 		st := off - off%PGSIZE
-		end := min(writeEnd+(PGSIZE-writeEnd%PGSIZE), int64(len(file.vData)))
+		end := min((writeEnd+PGSIZE-1)/PGSIZE*PGSIZE, int64(len(file.vData)))
 		if int64(len(file.dData)) < end {
 			file.dData = append(file.dData, make([]byte, end-int64(len(file.dData)))...)
 		}
@@ -296,9 +293,10 @@ func (fs *fileSys) fsync(ino uint64) error {
 	if !ok {
 		return fmt.Errorf("%d: inode number does not exist", ino)
 	}
-	if file.kind == FILE {
+	switch file.kind {
+	case FILE:
 		file.dData = append(file.dData[:0], file.vData...)
-	} else if file.kind == DIRECTORY {
+	case DIRECTORY:
 		fs.fsyncdir(file)
 	}
 	return nil
