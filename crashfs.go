@@ -9,6 +9,8 @@ import (
 	"strings"
 )
 
+const PGSIZE = 4096
+
 const (
 	FILE      = 0
 	DIRECTORY = 1
