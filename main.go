@@ -289,6 +289,7 @@ func record(h *harness, program string, args []string) error {
 	// Step 5 (runs last, via defer): unmount, so mountDir is empty again.
 	defer func() {
 		server.Unmount()
+		os.Remove(mountDir)
 		fmt.Printf("[unsynced] unmounted %s\n", mountDir)
 	}()
 
