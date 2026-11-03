@@ -39,8 +39,9 @@ func simulateCmd(args []string) error {
 		spec.CrashAfter = 0xFFFFFFFF
 	}
 	if *ext4 {
-		// Name and size changes persist up to the last sync before the crash:
-		// a sync commits the journal, which holds every change made before it.
+		// Name and size changes persist up to the last journal commit before
+		// the crash: a commit holds every change made before it.
+		commits := journalCommits(ops)
 		pending := []uint64{}
 		for _, op := range ops {
 			if op.Seq > spec.CrashAfter {
@@ -49,7 +50,7 @@ func simulateCmd(args []string) error {
 			if isMeta(op) {
 				pending = append(pending, op.Seq)
 			}
-			if isSync(op) {
+			if commits[op.Seq] {
 				spec.PersistSeq = append(spec.PersistSeq, pending...)
 				pending = pending[:0]
 			}
@@ -103,6 +104,7 @@ func verifyCmd(args []string) error {
 		return err
 	}
 
+	commits := journalCommits(ops)
 	fails := []Op{}
 	checkerErrs := 0
 	persist := []uint64{}
@@ -119,7 +121,7 @@ func verifyCmd(args []string) error {
 			// Changes no file, so it doesn't end a stream of acks: the crash
 			// point is the first op after the stream that does.
 		} else if lastAck || isSync(op) {
-			if *ext4 && isSync(op) {
+			if *ext4 && commits[op.Seq] {
 				persist = append(persist, pendingPers...)
 				pendingPers = pendingPers[:0]
 			}
@@ -192,4 +194,47 @@ func isReadOnly(op Op) bool {
 		return !strings.Contains(op.Flags, "O_TRUNC")
 	}
 	return false
+}
+
+// journalCommits returns the seqs of the syncs that commit ext4's journal.
+// fsync and fsyncdir always do. fdatasync does only if its file has a size
+// or block allocation change not committed yet: when only timestamps changed
+// (e.g. after overwriting data in place), ext4 flushes the data and skips the
+// commit, so other pending changes, like a rename, stay uncommitted.
+func journalCommits(ops []Op) map[uint64]bool {
+	commits := map[uint64]bool{}
+	written := map[uint64]int64{} // per inode: where the written data ends, i.e. the allocated blocks
+	dirty := map[uint64]bool{}    // per inode: a size or allocation change not committed yet
+	for _, op := range ops {
+		if op.Err != "" {
+			continue
+		}
+		switch op.Op {
+		case "INIT_FILE":
+			written[op.Inode] = op.Size
+		case "CREATE":
+			dirty[op.ChildIno] = true
+		case "OPEN":
+			if strings.Contains(op.Flags, "O_TRUNC") {
+				written[op.Inode], dirty[op.Inode] = 0, true
+			}
+		case "TRUNCATE":
+			written[op.Inode], dirty[op.Inode] = min(written[op.Inode], op.Size), true
+		case "FALLOCATE":
+			dirty[op.Inode] = true
+		case "WRITE":
+			if end := op.Off + op.DataLen; end > written[op.Inode] {
+				written[op.Inode], dirty[op.Inode] = end, true
+			}
+		case "FSYNC", "FSYNCDIR":
+			commits[op.Seq] = true
+			clear(dirty)
+		case "FDATASYNC":
+			if dirty[op.Inode] {
+				commits[op.Seq] = true
+				clear(dirty)
+			}
+		}
+	}
+	return commits
 }
